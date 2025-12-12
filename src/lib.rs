@@ -1,23 +1,9 @@
 #![doc = include_str!("../README.md")]
 #![deny(clippy::all, clippy::pedantic)]
 
-use std::sync::{Once, RwLock};
-
 use opentelemetry::{Key, KeyValue, Value};
 
 mod runtime;
-
-/// One-time instrument initialization.
-static INSTRUMENTS_INITIALIZED: Once = Once::new();
-
-/// Registry of all observed runtimes.
-static RUNTIMES: RwLock<Vec<TrackedRuntime>> = RwLock::new(Vec::new());
-
-/// A tracked runtime with its metrics and labels.
-pub(crate) struct TrackedRuntime {
-    pub(crate) metrics: tokio::runtime::RuntimeMetrics,
-    pub(crate) labels: Vec<KeyValue>,
-}
 
 /// Configuration for Tokio runtime instrumentation.
 ///
@@ -156,20 +142,7 @@ impl Config {
     ///
     /// Panics if the global runtime registry is poisoned.
     pub fn observe_runtime(self, handle: &tokio::runtime::Handle) {
-        // Ensure instruments are registered (one-time, thread-safe)
-        ensure_instruments_initialized();
-
-        // Build labels for this runtime
-        let labels = build_runtime_labels(handle, &self.labels);
-
-        // Add runtime to global registry
-        {
-            let mut runtimes = RUNTIMES.write().unwrap();
-            runtimes.push(TrackedRuntime {
-                metrics: handle.metrics(),
-                labels,
-            });
-        }
+        self::runtime::track_runtime(handle, &self.labels);
     }
 }
 
@@ -220,31 +193,4 @@ pub fn observe_current_runtime() {
 /// ```
 pub fn observe_runtime(handle: &tokio::runtime::Handle) {
     Config::default().observe_runtime(handle);
-}
-
-/// Build labels for a runtime (user labels + tokio.runtime.id if available).
-fn build_runtime_labels(handle: &tokio::runtime::Handle, labels: &[KeyValue]) -> Vec<KeyValue> {
-    let mut labels = labels.to_vec();
-
-    // Auto-add tokio.runtime.id when tokio_unstable is available
-    #[cfg(tokio_unstable)]
-    {
-        labels.push(KeyValue::new(
-            Key::from_static_str("tokio.runtime.id"),
-            handle.id().to_string(),
-        ));
-    }
-
-    // Silence unused parameter warning when tokio_unstable is not set
-    #[cfg(not(tokio_unstable))]
-    let _ = handle;
-
-    labels
-}
-
-/// Ensure instruments are initialized (one-time, thread-safe).
-fn ensure_instruments_initialized() {
-    INSTRUMENTS_INITIALIZED.call_once(|| {
-        self::runtime::register_all_instruments();
-    });
 }
