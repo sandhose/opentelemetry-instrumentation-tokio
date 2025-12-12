@@ -1,0 +1,30 @@
+[package]
+name = "opentelemetry-instrumentation-tokio"
+version = "0.1.0"
+edition = "2024"
+authors = ["Quentin Gliech <quentingliech@gmail.com>"]
+license = "Apache-2.0"
+description = "OpenTelemetry instrumentation for Tokio runtime metrics"
+repository = "https://github.com/sandhose/opentelemetry-instrumentation-tokio"
+documentation = "https://docs.rs/opentelemetry-instrumentation-tokio"
+readme = "README.md"
+keywords = ["opentelemetry", "tokio", "metrics", "observability", "telemetry"]
+categories = ["development-tools::debugging", "development-tools::profiling"]
+
+[features]
+default = ["net"]
+net = ["tokio/net"]
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tokio_unstable)'] }
+
+[dependencies]
+opentelemetry = { version = "0.31.0", default-features = false, features = ["metrics"] }
+tokio = { version = "1.0", default-features = false, features = ["rt"] }
+
+[dev-dependencies]
+tokio = { version = "1.45", features = ["rt-multi-thread", "macros"] }
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs", "tokio_unstable"]
