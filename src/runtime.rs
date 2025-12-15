@@ -4,8 +4,121 @@
 //! metrics. Each metric is implemented as a separate function for clarity and
 //! maintainability.
 
+use std::sync::{Once, RwLock};
+
 use opentelemetry::metrics::Meter;
 use opentelemetry::{InstrumentationScope, Key, KeyValue};
+
+/// One-time instrument initialization.
+static INSTRUMENTS_INITIALIZED: Once = Once::new();
+
+/// Registry of all observed runtimes.
+static RUNTIMES: RwLock<Vec<TrackedRuntime>> = RwLock::new(Vec::new());
+
+/// A tracked runtime with its metrics and labels.
+struct TrackedRuntime {
+    metrics: tokio::runtime::RuntimeMetrics,
+    labels: Vec<KeyValue>,
+
+    // Pre-computed labels for each worker. This assumes the # of workers never change in Tokio,
+    // which I think is the case?
+    workers_labels: Vec<Vec<KeyValue>>,
+
+    // Pre-computed labels for each bucket in the poll time histogram, for each worker
+    #[cfg(tokio_unstable)]
+    histogram_bucket_labels: Vec<Vec<Vec<KeyValue>>>,
+}
+
+/// Track a Tokio runtime for metrics collection.
+///
+/// This also initializes the instruments on the first call.
+pub(crate) fn track_runtime(handle: &tokio::runtime::Handle, labels: &[KeyValue]) {
+    // Ensure instruments are initialized (one-time, thread-safe).
+    INSTRUMENTS_INITIALIZED.call_once(|| {
+        register_all_instruments();
+    });
+
+    let labels = build_runtime_labels(handle, labels);
+
+    let workers_labels: Vec<Vec<_>> = (0..handle.metrics().num_workers())
+        .map(|i| {
+            let mut worker_labels = labels.clone();
+            worker_labels.push(worker_idx_attribute(i));
+            worker_labels
+        })
+        .collect();
+
+    #[cfg(tokio_unstable)]
+    let histogram_bucket_labels = 'result: {
+        if !handle.metrics().poll_time_histogram_enabled() {
+            // Don't collect histogram if not enabled
+            //
+            break 'result Vec::new();
+        }
+
+        let num_buckets = handle.metrics().poll_time_histogram_num_buckets();
+        let mut buckets_label: Vec<_> = (0..num_buckets)
+            .map(|bucket_idx| {
+                let range = handle
+                    .metrics()
+                    .poll_time_histogram_bucket_range(bucket_idx);
+                let value = range.end.as_nanos().try_into().unwrap_or(i64::MAX);
+                KeyValue::new("le", value)
+            })
+            .collect();
+
+        // Change the last bucket to +Inf
+        if let Some(last) = buckets_label.last_mut() {
+            *last = KeyValue::new("le", "+Inf");
+        }
+
+        workers_labels
+            .iter()
+            .map(|worker_labels| {
+                buckets_label
+                    .iter()
+                    .map(|bucket_label| {
+                        let mut labels = worker_labels.clone();
+                        labels.push(bucket_label.clone());
+                        labels
+                    })
+                    .collect()
+            })
+            .collect()
+    };
+
+    let tracked_runtime = TrackedRuntime {
+        metrics: handle.metrics().clone(),
+        labels,
+        workers_labels,
+        #[cfg(tokio_unstable)]
+        histogram_bucket_labels,
+    };
+
+    let mut runtimes = RUNTIMES.write().unwrap();
+    runtimes.push(tracked_runtime);
+}
+
+/// Build labels for a runtime (user labels + tokio.runtime.id if available).
+fn build_runtime_labels(handle: &tokio::runtime::Handle, labels: &[KeyValue]) -> Vec<KeyValue> {
+    #[cfg_attr(not(tokio_unstable), expect(unused_mut))]
+    let mut labels = labels.to_vec();
+
+    // Auto-add tokio.runtime.id when tokio_unstable is available
+    #[cfg(tokio_unstable)]
+    {
+        labels.push(KeyValue::new(
+            Key::from_static_str("tokio.runtime.id"),
+            handle.id().to_string(),
+        ));
+    }
+
+    // Silence unused parameter warning when tokio_unstable is not set
+    #[cfg(not(tokio_unstable))]
+    let _ = handle;
+
+    labels
+}
 
 /// Helper to construct a [`KeyValue`] with the worker index.
 fn worker_idx_attribute(i: usize) -> KeyValue {
@@ -16,7 +129,7 @@ fn worker_idx_attribute(i: usize) -> KeyValue {
 }
 
 /// Register all instruments (one-time, called via `Once`).
-pub(crate) fn register_all_instruments() {
+fn register_all_instruments() {
     let scope = InstrumentationScope::builder(env!("CARGO_PKG_NAME"))
         .with_version(env!("CARGO_PKG_VERSION"))
         .build();
@@ -75,7 +188,7 @@ fn register_workers_gauge(meter: &Meter) {
         .with_description("The number of worker threads used by the runtime")
         .with_unit("{worker}")
         .with_callback(|instrument| {
-            let runtimes = crate::RUNTIMES.read().unwrap();
+            let runtimes = RUNTIMES.read().unwrap();
             for runtime in runtimes.iter() {
                 instrument.observe(
                     runtime.metrics.num_workers().try_into().unwrap_or(u64::MAX),
@@ -92,7 +205,7 @@ fn register_global_queue_depth_gauge(meter: &Meter) {
         .with_description("The number of tasks currently scheduled in the runtime's global queue")
         .with_unit("{task}")
         .with_callback(|instrument| {
-            let runtimes = crate::RUNTIMES.read().unwrap();
+            let runtimes = RUNTIMES.read().unwrap();
             for runtime in runtimes.iter() {
                 instrument.observe(
                     runtime
@@ -113,13 +226,10 @@ fn register_worker_park_count_counter(meter: &Meter) {
         .u64_observable_counter("tokio.worker.park_count")
         .with_description("The total number of times the given worker thread has parked")
         .with_callback(|instrument| {
-            let runtimes = crate::RUNTIMES.read().unwrap();
+            let runtimes = RUNTIMES.read().unwrap();
             for runtime in runtimes.iter() {
-                let num_workers = runtime.metrics.num_workers();
-                for worker_idx in 0..num_workers {
-                    let mut attributes = runtime.labels.clone();
-                    attributes.push(worker_idx_attribute(worker_idx));
-                    instrument.observe(runtime.metrics.worker_park_count(worker_idx), &attributes);
+                for (worker_idx, labels) in runtime.workers_labels.iter().enumerate() {
+                    instrument.observe(runtime.metrics.worker_park_count(worker_idx), &labels[..]);
                 }
             }
         })
@@ -133,12 +243,9 @@ fn register_worker_busy_duration_counter(meter: &Meter) {
         .with_description("The amount of time the given worker thread has been busy")
         .with_unit("ms")
         .with_callback(|instrument| {
-            let runtimes = crate::RUNTIMES.read().unwrap();
+            let runtimes = RUNTIMES.read().unwrap();
             for runtime in runtimes.iter() {
-                let num_workers = runtime.metrics.num_workers();
-                for worker_idx in 0..num_workers {
-                    let mut attributes = runtime.labels.clone();
-                    attributes.push(worker_idx_attribute(worker_idx));
+                for (worker_idx, labels) in runtime.workers_labels.iter().enumerate() {
                     instrument.observe(
                         runtime
                             .metrics
@@ -146,7 +253,7 @@ fn register_worker_busy_duration_counter(meter: &Meter) {
                             .as_millis()
                             .try_into()
                             .unwrap_or(u64::MAX),
-                        &attributes,
+                        &labels[..],
                     );
                 }
             }
@@ -160,7 +267,7 @@ fn register_alive_tasks_gauge(meter: &Meter) {
         .with_description("The number of active tasks in the runtime")
         .with_unit("{task}")
         .with_callback(|instrument| {
-            let runtimes = crate::RUNTIMES.read().unwrap();
+            let runtimes = RUNTIMES.read().unwrap();
             for runtime in runtimes.iter() {
                 instrument.observe(
                     runtime
@@ -186,7 +293,7 @@ fn register_blocking_threads_gauge(meter: &Meter) {
         .with_description("The number of additional threads spawned by the runtime")
         .with_unit("{thread}")
         .with_callback(|instrument| {
-            let runtimes = crate::RUNTIMES.read().unwrap();
+            let runtimes = RUNTIMES.read().unwrap();
             for runtime in runtimes.iter() {
                 instrument.observe(
                     runtime
@@ -210,7 +317,7 @@ fn register_idle_blocking_threads_gauge(meter: &Meter) {
         )
         .with_unit("{thread}")
         .with_callback(|instrument| {
-            let runtimes = crate::RUNTIMES.read().unwrap();
+            let runtimes = RUNTIMES.read().unwrap();
             for runtime in runtimes.iter() {
                 instrument.observe(
                     runtime.metrics
@@ -231,7 +338,7 @@ fn register_remote_schedules_counter(meter: &Meter) {
         .with_description("The number of tasks scheduled from outside the runtime")
         .with_unit("{task}")
         .with_callback(|instrument| {
-            let runtimes = crate::RUNTIMES.read().unwrap();
+            let runtimes = RUNTIMES.read().unwrap();
             for runtime in runtimes.iter() {
                 instrument.observe(runtime.metrics.remote_schedule_count(), &runtime.labels);
             }
@@ -248,7 +355,7 @@ fn register_budget_forced_yields_counter(meter: &Meter) {
         )
         .with_unit("{yield}")
         .with_callback(|instrument| {
-            let runtimes = crate::RUNTIMES.read().unwrap();
+            let runtimes = RUNTIMES.read().unwrap();
             for runtime in runtimes.iter() {
                 instrument.observe(runtime.metrics.budget_forced_yield_count(), &runtime.labels);
             }
@@ -270,7 +377,7 @@ fn register_io_driver_fd_registrations_counter(meter: &Meter) {
         )
         .with_unit("{fd}")
         .with_callback(|instrument| {
-            let runtimes = crate::RUNTIMES.read().unwrap();
+            let runtimes = RUNTIMES.read().unwrap();
             for runtime in runtimes.iter() {
                 instrument.observe(runtime.metrics.io_driver_fd_registered_count(), &runtime.labels);
             }
@@ -292,7 +399,7 @@ fn register_io_driver_fd_deregistrations_counter(meter: &Meter) {
         )
         .with_unit("{fd}")
         .with_callback(|instrument| {
-            let runtimes = crate::RUNTIMES.read().unwrap();
+            let runtimes = RUNTIMES.read().unwrap();
             for runtime in runtimes.iter() {
                 instrument.observe(runtime.metrics.io_driver_fd_deregistered_count(), &runtime.labels);
             }
@@ -312,7 +419,7 @@ fn register_io_driver_fd_readies_counter(meter: &Meter) {
         .with_description("The number of ready events processed by the runtime's I/O driver")
         .with_unit("{event}")
         .with_callback(|instrument| {
-            let runtimes = crate::RUNTIMES.read().unwrap();
+            let runtimes = RUNTIMES.read().unwrap();
             for runtime in runtimes.iter() {
                 instrument.observe(runtime.metrics.io_driver_ready_count(), &runtime.labels);
             }
@@ -327,7 +434,7 @@ fn register_spawned_tasks_count_counter(meter: &Meter) {
         .with_description("The number of tasks spawned in this runtime since it was created")
         .with_unit("{task}")
         .with_callback(|instrument| {
-            let runtimes = crate::RUNTIMES.read().unwrap();
+            let runtimes = RUNTIMES.read().unwrap();
             for runtime in runtimes.iter() {
                 instrument.observe(runtime.metrics.spawned_tasks_count(), &runtime.labels);
             }
@@ -344,7 +451,7 @@ fn register_blocking_queue_depth_gauge(meter: &Meter) {
         )
         .with_unit("{task}")
         .with_callback(|instrument| {
-            let runtimes = crate::RUNTIMES.read().unwrap();
+            let runtimes = RUNTIMES.read().unwrap();
             for runtime in runtimes.iter() {
                 instrument.observe(
                     runtime.metrics
@@ -367,13 +474,10 @@ fn register_worker_noops_counter(meter: &Meter) {
         )
         .with_unit("{operation}")
         .with_callback(|instrument| {
-            let runtimes = crate::RUNTIMES.read().unwrap();
+            let runtimes = RUNTIMES.read().unwrap();
             for runtime in runtimes.iter() {
-                let num_workers = runtime.metrics.num_workers();
-                for worker_idx in 0..num_workers {
-                    let mut attributes = runtime.labels.clone();
-                    attributes.push(worker_idx_attribute(worker_idx));
-                    instrument.observe(runtime.metrics.worker_noop_count(worker_idx), &attributes);
+                for (worker_idx, labels) in runtime.workers_labels.iter().enumerate() {
+                    instrument.observe(runtime.metrics.worker_noop_count(worker_idx), &labels[..]);
                 }
             }
         })
@@ -388,13 +492,10 @@ fn register_worker_task_steals_counter(meter: &Meter) {
             "The number of tasks the given worker thread stole from another worker thread",
         )
         .with_callback(|instrument| {
-            let runtimes = crate::RUNTIMES.read().unwrap();
+            let runtimes = RUNTIMES.read().unwrap();
             for runtime in runtimes.iter() {
-                let num_workers = runtime.metrics.num_workers();
-                for worker_idx in 0..num_workers {
-                    let mut attributes = runtime.labels.clone();
-                    attributes.push(worker_idx_attribute(worker_idx));
-                    instrument.observe(runtime.metrics.worker_steal_count(worker_idx), &attributes);
+                for (worker_idx, labels) in runtime.workers_labels.iter().enumerate() {
+                    instrument.observe(runtime.metrics.worker_steal_count(worker_idx), &labels[..]);
                 }
             }
         })
@@ -409,15 +510,12 @@ fn register_worker_steal_operations_counter(meter: &Meter) {
             "The number of times the given worker thread stole tasks from another worker thread",
         )
         .with_callback(|instrument| {
-            let runtimes = crate::RUNTIMES.read().unwrap();
+            let runtimes = RUNTIMES.read().unwrap();
             for runtime in runtimes.iter() {
-                let num_workers = runtime.metrics.num_workers();
-                for worker_idx in 0..num_workers {
-                    let mut attributes = runtime.labels.clone();
-                    attributes.push(worker_idx_attribute(worker_idx));
+                for (worker_idx, labels) in runtime.workers_labels.iter().enumerate() {
                     instrument.observe(
                         runtime.metrics.worker_steal_operations(worker_idx),
-                        &attributes,
+                        &labels[..],
                     );
                 }
             }
@@ -432,13 +530,10 @@ fn register_worker_polls_counter(meter: &Meter) {
         .with_description("The number of tasks the given worker thread has polled")
         .with_unit("{task}")
         .with_callback(|instrument| {
-            let runtimes = crate::RUNTIMES.read().unwrap();
+            let runtimes = RUNTIMES.read().unwrap();
             for runtime in runtimes.iter() {
-                let num_workers = runtime.metrics.num_workers();
-                for worker_idx in 0..num_workers {
-                    let mut attributes = runtime.labels.clone();
-                    attributes.push(worker_idx_attribute(worker_idx));
-                    instrument.observe(runtime.metrics.worker_poll_count(worker_idx), &attributes);
+                for (worker_idx, labels) in runtime.workers_labels.iter().enumerate() {
+                    instrument.observe(runtime.metrics.worker_poll_count(worker_idx), &labels[..]);
                 }
             }
         })
@@ -454,13 +549,10 @@ fn register_worker_local_schedules_counter(meter: &Meter) {
         )
         .with_unit("{task}")
         .with_callback(|instrument| {
-            let runtimes = crate::RUNTIMES.read().unwrap();
+            let runtimes = RUNTIMES.read().unwrap();
             for runtime in runtimes.iter() {
-                let num_workers = runtime.metrics.num_workers();
-                for worker_idx in 0..num_workers {
-                    let mut attributes = runtime.labels.clone();
-                    attributes.push(worker_idx_attribute(worker_idx));
-                    instrument.observe(runtime.metrics.worker_local_schedule_count(worker_idx), &attributes);
+                for (worker_idx, labels) in runtime.workers_labels.iter().enumerate() {
+                    instrument.observe(runtime.metrics.worker_local_schedule_count(worker_idx), &labels[..]);
                 }
             }
         })
@@ -473,15 +565,12 @@ fn register_worker_overflows_counter(meter: &Meter) {
         .u64_observable_counter("tokio.worker.overflows")
         .with_description("The number of times the given worker thread saturated its local queue")
         .with_callback(|instrument| {
-            let runtimes = crate::RUNTIMES.read().unwrap();
+            let runtimes = RUNTIMES.read().unwrap();
             for runtime in runtimes.iter() {
-                let num_workers = runtime.metrics.num_workers();
-                for worker_idx in 0..num_workers {
-                    let mut attributes = runtime.labels.clone();
-                    attributes.push(worker_idx_attribute(worker_idx));
+                for (worker_idx, labels) in runtime.workers_labels.iter().enumerate() {
                     instrument.observe(
                         runtime.metrics.worker_overflow_count(worker_idx),
-                        &attributes,
+                        &labels[..],
                     );
                 }
             }
@@ -498,19 +587,16 @@ fn register_worker_local_queue_depth_gauge(meter: &Meter) {
         )
         .with_unit("{task}")
         .with_callback(|instrument| {
-            let runtimes = crate::RUNTIMES.read().unwrap();
+            let runtimes = RUNTIMES.read().unwrap();
             for runtime in runtimes.iter() {
-                let num_workers = runtime.metrics.num_workers();
-                for worker_idx in 0..num_workers {
-                    let mut attributes = runtime.labels.clone();
-                    attributes.push(worker_idx_attribute(worker_idx));
+                for (worker_idx, labels) in runtime.workers_labels.iter().enumerate() {
                     instrument.observe(
                         runtime
                             .metrics
                             .worker_local_queue_depth(worker_idx)
                             .try_into()
                             .unwrap_or(u64::MAX),
-                        &attributes,
+                        &labels[..],
                     );
                 }
             }
@@ -525,12 +611,9 @@ fn register_worker_mean_poll_time_gauge(meter: &Meter) {
         .with_description("The mean duration of task polls, in nanoseconds")
         .with_unit("ns")
         .with_callback(|instrument| {
-            let runtimes = crate::RUNTIMES.read().unwrap();
+            let runtimes = RUNTIMES.read().unwrap();
             for runtime in runtimes.iter() {
-                let num_workers = runtime.metrics.num_workers();
-                for worker_idx in 0..num_workers {
-                    let mut attributes = runtime.labels.clone();
-                    attributes.push(worker_idx_attribute(worker_idx));
+                for (worker_idx, labels) in runtime.workers_labels.iter().enumerate() {
                     instrument.observe(
                         runtime
                             .metrics
@@ -538,7 +621,7 @@ fn register_worker_mean_poll_time_gauge(meter: &Meter) {
                             .as_nanos()
                             .try_into()
                             .unwrap_or(u64::MAX),
-                        &attributes,
+                        &labels[..],
                     );
                 }
             }
@@ -553,44 +636,16 @@ fn register_poll_time_histogram(meter: &Meter) {
         .with_description("An histogram of the poll time of tasks, in nanoseconds")
         // We don't set a unit here, as it would add it as a suffix to the metric name
         .with_callback(|instrument| {
-            let runtimes = crate::RUNTIMES.read().unwrap();
+            let runtimes = RUNTIMES.read().unwrap();
             for runtime in runtimes.iter() {
-                // Skip if Tokio runtime doesn't have histogram collection enabled
-                if !runtime.metrics.poll_time_histogram_enabled() {
-                    continue;
-                }
-
-                // Prepare the key-value pairs for the histogram buckets
-                let mut buckets: Box<[_]> = (0..runtime.metrics.poll_time_histogram_num_buckets())
-                    .map(|i| {
-                        let range = runtime.metrics.poll_time_histogram_bucket_range(i);
-                        let value = range.end.as_nanos().try_into().unwrap_or(i64::MAX);
-                        let kv = KeyValue::new("le", value);
-                        (i, kv)
-                    })
-                    .collect();
-
-                // Change the last bucket to +Inf
-                if let Some(last) = buckets.last_mut() {
-                    last.1 = KeyValue::new("le", "+Inf");
-                }
-
-                // Emit histogram for each worker
-                let num_workers = runtime.metrics.num_workers();
-                for worker_idx in 0..num_workers {
+                for (worker_idx, labels) in runtime.histogram_bucket_labels.iter().enumerate() {
                     let mut sum = 0u64;
-                    for (bucket_idx, le) in &buckets {
+                    for (bucket_idx, labels) in labels.iter().enumerate() {
                         let count = runtime
                             .metrics
-                            .poll_time_histogram_bucket_count(worker_idx, *bucket_idx);
+                            .poll_time_histogram_bucket_count(worker_idx, bucket_idx);
                         sum += count;
-
-                        // Combine: runtime labels + worker_idx + le
-                        let mut attributes = runtime.labels.clone();
-                        attributes.push(worker_idx_attribute(worker_idx));
-                        attributes.push(le.clone());
-
-                        instrument.observe(sum, &attributes);
+                        instrument.observe(sum, &labels[..]);
                     }
                 }
             }
