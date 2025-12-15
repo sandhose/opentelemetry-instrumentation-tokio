@@ -23,6 +23,10 @@ struct TrackedRuntime {
     // Pre-computed labels for each worker. This assumes the # of workers never change in Tokio,
     // which I think is the case?
     workers_labels: Vec<Vec<KeyValue>>,
+
+    // Pre-computed labels for each bucket in the poll time histogram, for each worker
+    #[cfg(tokio_unstable)]
+    histogram_bucket_labels: Vec<Vec<Vec<KeyValue>>>,
 }
 
 /// Track a Tokio runtime for metrics collection.
@@ -36,7 +40,7 @@ pub(crate) fn track_runtime(handle: &tokio::runtime::Handle, labels: &[KeyValue]
 
     let labels = build_runtime_labels(handle, labels);
 
-    let workers_labels = (0..handle.metrics().num_workers())
+    let workers_labels: Vec<Vec<_>> = (0..handle.metrics().num_workers())
         .map(|i| {
             let mut worker_labels = labels.clone();
             worker_labels.push(worker_idx_attribute(i));
@@ -44,10 +48,51 @@ pub(crate) fn track_runtime(handle: &tokio::runtime::Handle, labels: &[KeyValue]
         })
         .collect();
 
+    #[cfg(tokio_unstable)]
+    let histogram_bucket_labels = 'result: {
+        if !handle.metrics().poll_time_histogram_enabled() {
+            // Don't collect histogram if not enabled
+            //
+            break 'result Vec::new();
+        }
+
+        let num_buckets = handle.metrics().poll_time_histogram_num_buckets();
+        let mut buckets_label: Vec<_> = (0..num_buckets)
+            .map(|bucket_idx| {
+                let range = handle
+                    .metrics()
+                    .poll_time_histogram_bucket_range(bucket_idx);
+                let value = range.end.as_nanos().try_into().unwrap_or(i64::MAX);
+                KeyValue::new("le", value)
+            })
+            .collect();
+
+        // Change the last bucket to +Inf
+        if let Some(last) = buckets_label.last_mut() {
+            *last = KeyValue::new("le", "+Inf");
+        }
+
+        workers_labels
+            .iter()
+            .map(|worker_labels| {
+                buckets_label
+                    .iter()
+                    .map(|bucket_label| {
+                        let mut labels = worker_labels.clone();
+                        labels.push(bucket_label.clone());
+                        labels
+                    })
+                    .collect()
+            })
+            .collect()
+    };
+
     let tracked_runtime = TrackedRuntime {
         metrics: handle.metrics().clone(),
         labels,
         workers_labels,
+        #[cfg(tokio_unstable)]
+        histogram_bucket_labels,
     };
 
     let mut runtimes = RUNTIMES.write().unwrap();
@@ -56,6 +101,7 @@ pub(crate) fn track_runtime(handle: &tokio::runtime::Handle, labels: &[KeyValue]
 
 /// Build labels for a runtime (user labels + tokio.runtime.id if available).
 fn build_runtime_labels(handle: &tokio::runtime::Handle, labels: &[KeyValue]) -> Vec<KeyValue> {
+    #[cfg_attr(not(tokio_unstable), expect(unused_mut))]
     let mut labels = labels.to_vec();
 
     // Auto-add tokio.runtime.id when tokio_unstable is available
@@ -592,42 +638,14 @@ fn register_poll_time_histogram(meter: &Meter) {
         .with_callback(|instrument| {
             let runtimes = RUNTIMES.read().unwrap();
             for runtime in runtimes.iter() {
-                // Skip if Tokio runtime doesn't have histogram collection enabled
-                if !runtime.metrics.poll_time_histogram_enabled() {
-                    continue;
-                }
-
-                // Prepare the key-value pairs for the histogram buckets
-                let mut buckets: Box<[_]> = (0..runtime.metrics.poll_time_histogram_num_buckets())
-                    .map(|i| {
-                        let range = runtime.metrics.poll_time_histogram_bucket_range(i);
-                        let value = range.end.as_nanos().try_into().unwrap_or(i64::MAX);
-                        let kv = KeyValue::new("le", value);
-                        (i, kv)
-                    })
-                    .collect();
-
-                // Change the last bucket to +Inf
-                if let Some(last) = buckets.last_mut() {
-                    last.1 = KeyValue::new("le", "+Inf");
-                }
-
-                // Emit histogram for each worker
-                let num_workers = runtime.metrics.num_workers();
-                for worker_idx in 0..num_workers {
+                for (worker_idx, labels) in runtime.histogram_bucket_labels.iter().enumerate() {
                     let mut sum = 0u64;
-                    for (bucket_idx, le) in &buckets {
+                    for (bucket_idx, labels) in labels.iter().enumerate() {
                         let count = runtime
                             .metrics
-                            .poll_time_histogram_bucket_count(worker_idx, *bucket_idx);
+                            .poll_time_histogram_bucket_count(worker_idx, bucket_idx);
                         sum += count;
-
-                        // Combine: runtime labels + worker_idx + le
-                        let mut attributes = runtime.labels.clone();
-                        attributes.push(worker_idx_attribute(worker_idx));
-                        attributes.push(le.clone());
-
-                        instrument.observe(sum, &attributes);
+                        instrument.observe(sum, &labels[..]);
                     }
                 }
             }
