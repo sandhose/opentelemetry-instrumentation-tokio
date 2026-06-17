@@ -19,7 +19,7 @@ net = ["tokio/net"]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tokio_unstable)'] }
 
 [dependencies]
-opentelemetry = { version = "0.31.0", default-features = false, features = ["metrics"] }
+opentelemetry = { version = "0.32.0", default-features = false, features = ["metrics"] }
 tokio = { version = "1.0", default-features = false, features = ["rt"] }
 
 [dev-dependencies]
