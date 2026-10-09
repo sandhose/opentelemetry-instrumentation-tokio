@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0](https://github.com/sandhose/opentelemetry-instrumentation-tokio/compare/v0.2.0...v0.3.0) - 2026-10-09
+
+### Added
+
+- [**breaking**] update to opentelemetry 0.33
+
 ## [0.2.0](https://github.com/sandhose/opentelemetry-instrumentation-tokio/compare/v0.1.2...v0.2.0) - 2026-06-17
 
 ### Added
